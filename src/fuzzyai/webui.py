@@ -1,4 +1,5 @@
 # type: ignore
+import hashlib
 import os
 import subprocess
 import sys
@@ -25,6 +26,22 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Authentication gate
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("FuzzyAI Web UI - Login")
+    password = st.text_input("Enter password", type="password")
+    expected_hash = hashlib.sha256(os.environ.get("FUZZYAI_PASSWORD", "fuzzyai").encode()).hexdigest()
+    if hashlib.sha256(password.encode()).hexdigest() == expected_hash:
+        st.session_state.authenticated = True
+        st.rerun()
+    else:
+        if password:
+            st.error("Incorrect password")
+    st.stop()
 
 logo_path = Path(__file__).parent / "resources" / "logo.png"
 st.sidebar.image(str(logo_path), width=175)
@@ -75,8 +92,7 @@ with st.sidebar.container():
         for key, value in dict(st.session_state.env_vars).items():
             col1, col2, col3 = st.columns([2, 2, 1])
             col1.text(key)
-            #masked_value = '*' * len(value) if 'key' in key.lower() or 'token' in key.lower() else value
-            masked_value = value[:8] + "..."
+            masked_value = "***SET***" if value else ""
             col2.text(masked_value)
             if col3.button("❌", key=f"delete_{key}"):
                 del st.session_state.env_vars[key]
@@ -294,10 +310,8 @@ elif st.session_state.step == 5:
 
 
     st.code(" ".join(command))
-    st.subheader("Edit before executing")
-    new_command = st.text_input("command", " ".join(command))
     
-    col1, col2, col3 = st.columns([1,1,1])
+    col1, col2 = st.columns([1,1])
 
     with col1:
         if st.button("Back"):
@@ -305,19 +319,12 @@ elif st.session_state.step == 5:
             st.rerun()
     with col2:
         run_button = st.button("Run")
-    with col3:
-        if st.button("Restart"):
-            st.session_state.step = 1
-            st.rerun()
     
     if run_button:
         env = os.environ.copy()
         env.update(st.session_state.env_vars)
         try:
-            idx = new_command.split(" ").index("-t")
-            all_args = new_command.split(" ")[:idx+1]
-            all_args.append(" ".join(new_command.split(" ")[idx+1:]))
-            result = subprocess.run(all_args, capture_output=True, text=True, env=env)
+            result = subprocess.run(command, capture_output=True, text=True, env=env)
             st.code(result.stdout + result.stderr)
         except Exception as e:
             st.error(f"Error: {str(e)}")

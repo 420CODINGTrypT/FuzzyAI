@@ -37,7 +37,15 @@ class Fuzzer:
         self._extra = extra
         self._classification_batch_size = 150
 
-        self._mongo_client: AsyncIOMotorClient = AsyncIOMotorClient(db_address, 27017)  # ignore: type
+        mongo_options = {
+            "serverSelectionTimeoutMS": 5000,
+            "connectTimeoutMS": 5000,
+            "socketTimeoutMS": 30000,
+            "maxPoolSize": 50,
+            "minPoolSize": 5,
+        }
+        mongo_uri = db_address if db_address.startswith("mongodb://") or db_address.startswith("mongodb+srv://") else f"mongodb://{db_address}:27017"
+        self._mongo_client: AsyncIOMotorClient = AsyncIOMotorClient(mongo_uri, **mongo_options)
         self._adv_prompts_handler = AdversarialPromptsHandler(self._mongo_client)
         self._adv_suffixes_handler = AdversarialSuffixesHandler(self._mongo_client)
         self._adv_attacks_handler = AdversarialAttacksHandler(self._mongo_client)
@@ -197,41 +205,55 @@ class Fuzzer:
             attack_mode (FuzzerAttackMode): The attack mode.
         """
         raw_results: list[AttackSummary] = []
-        attack_handler: Optional[BaseAttackTechniqueHandlerProto] = None
+        all_attack_handlers: list[BaseAttackTechniqueHandlerProto] = []
         
         logger.info('Starting fuzzer...')
         
         start_time = time.time()
 
-        # Verify that all models has been added by add_llm
+        max_workers: int = extra.get('max_workers', 1)
+        semaphore = asyncio.Semaphore(max_workers)
+
+        # Build task list for all model + attack_mode combinations
+        attack_tasks_params: list[tuple[str, FuzzerAttackMode]] = []
+
         for model in models:
             if not any(llm.qualified_model_name == model for llm in self._llms):
                 logger.error(f"Model {model} has not been added to the fuzzer, skipping...")
                 continue
 
             for attack_mode in attack_modes:
+                attack_tasks_params.append((model, attack_mode))
+
+        async def _run_attack(model: str, attack_mode: FuzzerAttackMode) -> Optional[AttackSummary]:
+            async with semaphore:
                 logger.info(f'Attacking {len(prompts)} prompts with attack mode: {attack_mode} for model: {model}...')
                 extra.update(**self._extra)
                 attack_handler = self._attack_technique_factory(attack_mode, model=model, **extra)
+                all_attack_handlers.append(attack_handler)
 
-                attack_result: Optional[AttackSummary] = await attack_handler.attack(prompts)
-                if attack_result:
-                    attack_result.attack_mode = attack_mode
-                    attack_result.model = model
-                    attack_result.system_prompt = extra.get('system_prompt', 'No system prompt set')
-                    logger.info(f'Finished attacking {len(prompts)} prompts for attack mode {attack_mode}')
-                    raw_results.append(attack_result)
-                else:
-                    logger.error(f'Failed to attack {len(prompts)} prompts for attack mode {attack_mode}')
-        
+                try:
+                    attack_result: Optional[AttackSummary] = await attack_handler.attack(prompts)
+                    if attack_result:
+                        attack_result.attack_mode = attack_mode
+                        attack_result.model = model
+                        attack_result.system_prompt = extra.get('system_prompt', 'No system prompt set')
+                        logger.info(f'Finished attacking {len(prompts)} prompts for attack mode {attack_mode}')
+                        return attack_result
+                    else:
+                        logger.error(f'Failed to attack {len(prompts)} prompts for attack mode {attack_mode}')
+                except Exception as e:
+                    logger.error(f'Attack {attack_mode} on {model} failed: {e}')
+                return None
+
+        # Execute all attacks in parallel, respecting max_workers
+        results = await asyncio.gather(*[_run_attack(m, am) for m, am in attack_tasks_params])
+        raw_results = [r for r in results if r is not None]
+
         logger.info('Done, took %s seconds', time.time() - start_time)
         
-        if attack_handler is not None and self._cleanup:
-            await asyncio.gather(attack_handler.close())
+        if all_attack_handlers and self._cleanup:
+            await asyncio.gather(*[handler.close() for handler in all_attack_handlers])
 
         report = FuzzerResult.from_attack_summary(self._attack_id, raw_results)
         return report, raw_results
-    
-
-
-

@@ -32,9 +32,9 @@ load_dotenv()
 
 banner = """\033[31m
    ______  ____________  ___ ___   ____
-  / __/ / / /_  /_  /\\ \\/ (_) _ | /  _/
- / _// /_/ / / /_/ /_ \\  / / __ |_/ /  
-/_/  \\____/ /___/___/ /_(_)_/ |_/___/  
+  / __/ / / /_  /_  /\ \/ (_) _ | /  _/
+ / _// /_/ / / /_/ /_ \  / / __ |_/ /  
+/_/  \____/ /___/___/ /_(_)_/ |_/___/  
                                        
 \033[0m"""
 
@@ -75,6 +75,15 @@ def find_available_port(start_port: int, max_attempts: int = 100) -> int:
             if s.connect_ex(('localhost', port)) != 0:
                 return port
     raise RuntimeError(f"Could not find an available port in range {start_port}-{start_port + max_attempts}")
+
+def _validate_config_file(path: str) -> Any:
+    """Validate configuration file path to prevent arbitrary file reads."""
+    p = Path(path).resolve()
+    if p.suffix.lower() != '.json':
+        raise argparse.ArgumentTypeError(f"Configuration file must be a .json file, got: {p}")
+    if not p.is_file():
+        raise argparse.ArgumentTypeError(f"Configuration file not found: {p}")
+    return open(p, 'r', encoding='utf-8')
 
 async def run_fuzzer(args: argparse.Namespace) -> None:
     """
@@ -123,7 +132,7 @@ async def run_fuzzer(args: argparse.Namespace) -> None:
             extra.update(**vars(args))
         else:
             extra = vars(args)
-    except Exception:
+    except ValueError:
         raise ValueError(f"Error adding extra argument, please make sure you use the correct format, i.e -e key=value. For further help, please check the wiki: {WIKI_LINK}")
 
     if hasattr(args, 'target_prompts_file') and args.target_prompts_file:
@@ -208,7 +217,7 @@ async def run_webui(args: argparse.Namespace) -> None:
         port = find_available_port(8080)
     
     process = subprocess.Popen(
-        ["streamlit", "run", os.path.join("src", "fuzzyai", "webui.py"), "--server.port", str(port)],
+        ["streamlit", "run", os.path.join(os.path.dirname(__file__), "webui.py"), "--server.port", str(port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )
@@ -238,7 +247,7 @@ async def run_cli() -> None:
     fuzz_parser.add_argument('-d', '--db_address', help='MongoDB address (default: 127.0.0.1)', type=str, default="127.0.0.1")
     fuzz_parser.add_argument('-w', '--max_workers', help='Max workers (default: 1)', type=int, default=1)
     fuzz_parser.add_argument('-i', '--attack_id', help='Load previous attack id', type=str, default=None)
-    fuzz_parser.add_argument('-C', '--configuration_file', help='Load fuzzer arguments from JSON configuration file', type=open, action=LoadFromFile)
+    fuzz_parser.add_argument('-C', '--configuration_file', help='Load fuzzer arguments from JSON configuration file', type=_validate_config_file, action=LoadFromFile)
 
     # create models help string
     models: dict[LLMProvider, list[str]] = {}

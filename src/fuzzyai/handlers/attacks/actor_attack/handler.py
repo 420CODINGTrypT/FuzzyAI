@@ -1,157 +1,141 @@
 import logging
-from typing import Any, Final, Optional, Type
+from typing import Any
 
-from pydantic import BaseModel, Field
-
-from fuzzyai.consts import DEFAULT_OPEN_SOURCE_MODEL
-from fuzzyai.enums import LLMRole
-from fuzzyai.handlers.attacks.actor_attack.prompts import (ACTORS_GENERATION_PROMPT, BEHAVIOR_EXTRACTION_PROMPT,
-                                                           QUESTIONS_GENERATION_PROMPT)
-from fuzzyai.handlers.attacks.actor_attack.utils import generate_model_error
-from fuzzyai.handlers.attacks.base import (BaseAttackTechniqueHandler, BaseAttackTechniqueHandlerException,
-                                           attack_handler_fm)
+from fuzzyai.handlers.attacks.base import BaseAttackTechniqueHandler, attack_handler_fm
 from fuzzyai.handlers.attacks.enums import FuzzerAttackMode
 from fuzzyai.handlers.attacks.models import AttackResultEntry
-from fuzzyai.llm.providers.base import BaseLLMMessage, BaseLLMProvider, BaseLLMProviderException
+from fuzzyai.handlers.attacks.proto import AttackSummary, BaseAttackTechniqueHandlerProto
+from fuzzyai.llm.providers.base import BaseLLMProvider
+from fuzzyai.utils.safe_format import safe_format
+
+from .prompts import (BEHAVIOR_DISCOVERY_PROMPT, BEHAVIOR_DISCOVERY_SUMMARY_PROMPT,
+                      COMPLETE_BEHAVIOR_PROMPT, GENERATE_ACTOR_PROMPT, PROMPT_TEMPLATE)
+from .utils import extract_all_brackets, extract_brackets, generate_name, generate_random_hex
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ACTORS_GENERATION_MODEL: Final[str] = DEFAULT_OPEN_SOURCE_MODEL
-DEFAULT_BEHAVIOR_EXTRACTION_MODEL: Final[str] = DEFAULT_OPEN_SOURCE_MODEL
-DEFAULT_QUESTIONS_GENERATION_MODEL: Final[str] = DEFAULT_OPEN_SOURCE_MODEL
 
-SPLIT_TOKEN: Final[str] = '[SPLIT]'
-MODELS_TYPES: Final[list[str]] = ["behavior extraction", "actors generation", "questions generation"]
-MODELS_DEFAULTS: Final[list[str]] = [DEFAULT_BEHAVIOR_EXTRACTION_MODEL, DEFAULT_ACTORS_GENERATION_MODEL, DEFAULT_QUESTIONS_GENERATION_MODEL]
-
-
-class ActorsGenerationException(BaseAttackTechniqueHandlerException):
-    """
-    Exception for actors generation error.
-    """
-    ...
-
-
-class BehaviorExtractionException(BaseAttackTechniqueHandlerException):
-    """
-    Exception for behavior extraction error.
-    """
-    ...
-
-
-class QuestionsGenerationException(BaseAttackTechniqueHandlerException):
-    """
-    Exception for questions generation error.
-    """
-    ...
-
-
-class AnswerGenerationException(BaseAttackTechniqueHandlerException):
-    """
-    Exception for answers generation error.
-    """
-    ...
-
-
-class ActorAttackHandlerExtraParams(BaseModel):
-    behavior_extraction_model: str = Field(DEFAULT_BEHAVIOR_EXTRACTION_MODEL,
-                                           description=f"The model to extract the main behavior from the original prompt. default: {DEFAULT_BEHAVIOR_EXTRACTION_MODEL}")
-    actors_generation_model: str = Field(DEFAULT_ACTORS_GENERATION_MODEL,
-                                         description=f"The model to generate actors leading to the answer for the original prompt. default: {DEFAULT_ACTORS_GENERATION_MODEL}")
-    questions_generation_model: str = Field(DEFAULT_QUESTIONS_GENERATION_MODEL,
-                                            description=f"The model to generate questions using the actors and the behavior. default: {DEFAULT_QUESTIONS_GENERATION_MODEL}")
-
-
-@attack_handler_fm.flavor(FuzzerAttackMode.ACTOR)
-class ActorAttackHandler(BaseAttackTechniqueHandler[ActorAttackHandlerExtraParams]):
-    """
-    Actor attack handler - Inspired by actor-network theory, it builds semantic networks of "actors" to subtly guide
-     conversations toward harmful targets while concealing malicious intent.
-    """
-
-    def __init__(self, **extra: Any):
+class ActorAttackHandler(BaseAttackTechniqueHandler):
+    
+    def __init__(self, **extra: Any) -> None:
         super().__init__(**extra)
-        for index, model in enumerate([self._extra_args.behavior_extraction_model,
-                                       self._extra_args.actors_generation_model,
-                                       self._extra_args.questions_generation_model]):
-            if model not in self._model_queue_map:
-                raise RuntimeError(generate_model_error(MODELS_TYPES[index], model, MODELS_DEFAULTS[index]))
+        self._action_performed = False
+        self._action_dicts: list[dict[str, str]] = []
 
-    async def _attack(self, prompt: str, **extra: Any) -> Optional[AttackResultEntry]:
-        chat_messages: list[BaseLLMMessage] = []
-        llm: BaseLLMProvider
+    def _add_action(self, actor_name: str, action: str, role_description: str = '') -> None:
+        if not action or not actor_name:
+            return
+        
+        action_dict = {
+            "actor_name": actor_name,
+            "action": action,
+            "role_description": role_description
+        }
+        
+        if action_dict not in self._action_dicts:
+            self._action_dicts.append(action_dict)
+            self._action_performed = True
 
-        logger.info("Extracting main behavior from the prompt")
-        async with self._borrow(self._extra_args.behavior_extraction_model) as llm:
-            try:
-                behavior_extraction_prompt = BEHAVIOR_EXTRACTION_PROMPT.format(ORIGINAL_PROMPT=prompt)
-                behavior_extraction_response = await llm.generate(behavior_extraction_prompt)
-                if behavior_extraction_response is None:
-                    raise BehaviorExtractionException("No response from the behavior extraction model")
-            except BaseLLMProviderException as e:
-                raise BehaviorExtractionException(f"Problem occurred during behavior extraction. {e}")
-        behavior_response = behavior_extraction_response.response
+    async def _perform_behavior_discovery(self, llm: BaseLLMProvider, prompt: str, **extra: Any) -> str:
+        logger.debug("Performing behavior discovery...")
+        behavior_response = ""
+        
+        for i in range(3):
+            logger.debug(f"Iteration {i+1}/3")
+            
+            behavior_prompt = safe_format(BEHAVIOR_DISCOVERY_PROMPT, BEHAVIOR=behavior_response, ORIGINAL_PROMPT=prompt)
+            
+            iteration = 0
+            async for response in llm.generate(behavior_prompt, **extra):
+                if iteration == 0:
+                    brackets = extract_brackets(response.response)
+                    if not brackets:
+                        break
+                    for behavior in brackets:
+                        self._add_action(generate_name(), behavior, 'custom behavior')
+                else:
+                    for bracket in extract_all_brackets(response.response):
+                        if bracket and isinstance(bracket, list):
+                            for b in bracket:
+                                if isinstance(b, str):
+                                    self._add_action(generate_name(), b)
+                        elif isinstance(bracket, str):
+                            self._add_action(generate_name(), bracket)
+                iteration += 1
+                behavior_response = response.response
+        
+        return behavior_response
+    
+    async def _generate_summary(self, llm: BaseLLMProvider, behavior_response: str, **extra: Any) -> str:
+        summary_prompt = safe_format(BEHAVIOR_DISCOVERY_SUMMARY_PROMPT, BEHAVIOR_RESPONSE=behavior_response)
+        
+        summary_response = ""
+        async for response in llm.generate(summary_prompt, **extra):
+            summary_response = response.response
+            
+            for brackets in extract_all_brackets(response.response):
+                if brackets and isinstance(brackets, list):
+                    for b in brackets:
+                        if isinstance(b, str):
+                            self._add_action(generate_name(), b)
+                elif isinstance(brackets, str):
+                    self._add_action(generate_name(), brackets)
+        
+        return summary_response
+    
+    async def _generate_new_actor(self, llm: BaseLLMProvider, behavior_response: str, summary_response: str, prompt: str, **extra: Any) -> str:
+        actor = generate_random_hex()
+        new_actor_prompt = safe_format(GENERATE_ACTOR_PROMPT,
+                                        BEHAVIOR_RESPONSE=behavior_response,
+                                        BEHAVIOR_SUMMARY=summary_response,
+                                        ORIGINAL_PROMPT=prompt,
+                                        ACTOR=actor)
+        
+        action_response = ""
+        async for response in llm.generate(new_actor_prompt, **extra):
+            action_response = response.response
+            brackets = extract_brackets(response.response)
+            if brackets:
+                self._add_action(actor, brackets[0], brackets[0])
+        
+        return action_response
+    
+    async def _attack(self, prompt: str, **extra: Any) -> AttackResultEntry:
+        logger.debug(f"Generating actor attack for prompt: {prompt}")
+        
+        llm: BaseLLMProvider = self._llms[0]
+        
+        behavior_response = await self._perform_behavior_discovery(llm, prompt, **extra)
+        summary_response = await self._generate_summary(llm, behavior_response, **extra)
+        await self._generate_new_actor(llm, behavior_response, summary_response, prompt, **extra)
+        
+        actions_str = "\n".join(f"{i+1}. {action['actor_name']} - {action['action']}" for i, action in enumerate(self._action_dicts))
+        
+        final_prompt = safe_format(COMPLETE_BEHAVIOR_PROMPT,
+                                    BEHAVIOR_DISCOVERY=actions_str,
+                                    ORIGINAL_PROMPT=prompt)
+        
+        response = ""
+        async for res in llm.generate(final_prompt, **extra):
+            response = res.response
+        
+        return AttackResultEntry(original_prompt=prompt, current_prompt=final_prompt, response=response)
+    
+    @staticmethod
+    def description() -> str:
+        return "ActorAttack: Inspired by actor-network theory, it builds semantic networks of actors to subtly guide conversations toward harmful targets"
 
-        logger.info("Generating relevant actors to the behavior")
-        async with self._borrow(self._extra_args.actors_generation_model) as llm:
-            try:
-                actors_extraction_prompt = ACTORS_GENERATION_PROMPT.format(EXTRACTED_BEHAVIOR=behavior_response)
-                actors_extraction_response = await llm.generate(actors_extraction_prompt)
-                if actors_extraction_response is None:
-                    raise ActorsGenerationException("No response from the actor generation model")
-            except BaseLLMProviderException as e:
-                raise ActorsGenerationException(f"Problem occurred during actor generation. {e}")
-        actors_response = actors_extraction_response.response
-        all_actors = actors_response.split(SPLIT_TOKEN)
+    @staticmethod
+    def def_extra_args() -> dict[str, Any]:
+        return {}
 
-        actors_questions_dict = {}
+    @staticmethod
+    def default_auxiliary_models() -> list[str] | None:
+        return None
 
-        logger.info("Generating questions based on the behavior and actors")
-        async with self._borrow(self._extra_args.questions_generation_model) as llm:
-            for actor in all_actors:
-                try:
-                    questions_generation_prompt = QUESTIONS_GENERATION_PROMPT.format(EXTRACTED_BEHAVIOR=behavior_response,
-                                                                                     ACTOR=actor)
-                    questions_generation_response = await llm.generate(questions_generation_prompt)
-                    if questions_generation_response is None:
-                        raise QuestionsGenerationException("No response from the questions generation model.")
+    @staticmethod
+    def required_extra_args() -> list[str]:
+        return []
 
-                    single_actor_questions = questions_generation_response.response.split(SPLIT_TOKEN)
-                    if single_actor_questions is None:
-                        raise QuestionsGenerationException("No response from the questions generation model.")
 
-                    if actor not in actors_questions_dict:
-                        actors_questions_dict[actor] = single_actor_questions
-                except BaseLLMProviderException as e:
-                    raise QuestionsGenerationException(f"Problem occurred during questions generation. {e}")
-
-        logger.info("Sending questions to the target model")
-        async with self._borrow(self._model) as llm:
-            for actor in actors_questions_dict:
-                logger.debug(f"Using actor {actor}")
-                last_actor = actor
-                for question in actors_questions_dict[actor]:
-                    logger.debug(f"Running question {question}")
-                    chat_messages.append(BaseLLMMessage(role=LLMRole.USER, content=question))
-                    last_answer = await llm.chat(chat_messages)
-                    if last_answer is None:
-                        raise AnswerGenerationException("No response from the target model")
-                    last_answer_response = last_answer.response
-                    chat_messages.append(BaseLLMMessage(role=LLMRole.ASSISTANT, content=last_answer_response))
-                classifications = await self._classify_llm_response(last_answer, original_prompt=prompt)
-                if list(classifications.values())[0] != 0:
-                    break
-
-            result = AttackResultEntry(original_prompt=prompt,
-                                       current_prompt="\n".join(actors_questions_dict[last_actor]),
-                                       response=last_answer_response) if last_answer else None
-            logger.debug("Response: %s", last_answer_response if last_answer else "None")
-
-        if result:
-            result.classifications = classifications
-
-        return result
-
-    @classmethod
-    def extra_args_cls(cls) -> Type[BaseModel]:
-        return ActorAttackHandlerExtraParams
+attack_handler_fm.register(FuzzerAttackMode.ACTOR_ATTACK, ActorAttackHandler)
